@@ -1,1 +1,639 @@
+-- ================================================
+-- SCRIPT DE ADMIN COMPLETO - v7 FINAL
+-- ColÃ³calo en: ServerScriptService
+-- REQUIERE: AntiExploitGui (LocalScript en StarterGui)
+-- ================================================
 
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- ================================================
+-- CONFIGURACIÃ“N
+-- ================================================
+local ADMIN_IDS = {
+	7010544216,
+}
+
+local SPEED_LIMIT     = 32   -- WalkSpeed mÃ¡ximo permitido para no-admins
+local JUMP_LIMIT      = 101  -- JumpPower mÃ¡ximo permitido
+local TP_SPEED_LIMIT  = 200  -- studs/s mÃ¡ximo antes de detectar TP hack
+local DETECT_INTERVAL = 0.5  -- segundos entre checks de posiciÃ³n
+
+-- ================================================
+-- REMOTE EVENTS
+-- ================================================
+local remotes = Instance.new("Folder")
+remotes.Name  = "AdminRemotes"
+remotes.Parent = ReplicatedStorage
+
+local showExploitGui  = Instance.new("RemoteEvent")
+showExploitGui.Name   = "ShowExploitGui"
+showExploitGui.Parent = remotes
+
+local exploitResponse = Instance.new("RemoteEvent")
+exploitResponse.Name  = "ExploitResponse"
+exploitResponse.Parent = remotes
+
+-- ================================================
+-- ALMACENAMIENTO
+-- ================================================
+local banned       = {}
+local tempBanned   = {}
+local rkillLoops   = {}
+local rflyLoops    = {}
+local rnoclipLoops = {}
+local flyData      = {}
+local noclipData   = {}
+local godData      = {}
+local invisData    = {}
+local freezeData   = {}
+local rtoolLoops   = {}
+local cloneData    = {}
+
+-- Anti-exploit
+local exploitData       = {}  -- {lastPos, lastTime, heartbeatConn}
+local exploitFrozen     = {}  -- jugador esperando respuesta en GUI
+local exploitStrike2    = {}  -- segunda ofensa
+local exploitResponding = {}  -- debounce de respuesta
+local exploitWarned    = {}  -- jugador ya fue advertido al menos una vez (perdonado)
+local allowedSpeed      = {}  -- {ws, jp} dado por admin para ese jugador
+
+-- ================================================
+-- UTILIDADES
+-- ================================================
+
+local function isAdmin(player)
+	for _, id in ipairs(ADMIN_IDS) do
+		if id == player.UserId then return true end
+	end
+	return false
+end
+
+local function getChar(p)  return p and p.Character end
+local function getHRP(p)   local c = getChar(p); return c and c:FindFirstChild("HumanoidRootPart") end
+local function getHum(p)   local c = getChar(p); return c and c:FindFirstChildOfClass("Humanoid") end
+
+local function notify(player, msg)
+	pcall(function()
+		local h = player.Character and player.Character:FindFirstChild("Head")
+		if h then game:GetService("Chat"):Chat(h, "[âœ“] "..msg, Enum.ChatColor.Green) end
+	end)
+end
+
+local function findPlayer(name)
+	if not name then return nil end
+	name = name:lower()
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p.Name:lower():find(name, 1, true) then return p end
+	end
+	return nil
+end
+
+local function getTargets(admin, name)
+	if not name then return {admin} end
+	local t = name:lower()
+	if t == "all" then
+		return Players:GetPlayers()
+	elseif t == "others" then
+		local list = {}
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= admin then table.insert(list, p) end
+		end
+		return list
+	elseif t == "me" then
+		return {admin}
+	else
+		local p = findPlayer(name)
+		return p and {p} or {}
+	end
+end
+
+-- FIX: resetear posiciÃ³n guardada para evitar false-positive tras tp admin
+local function resetExploitPos(player)
+	if exploitData[player] then
+		exploitData[player].lastPos  = nil
+		exploitData[player].lastTime = tick()
+	end
+end
+
+-- ================================================
+-- FLY
+-- ================================================
+local function enableFly(player)
+	if flyData[player] then return end
+	local char = getChar(player)
+	if not char then return end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hrp or not hum then return end
+
+	hum.PlatformStand = true
+
+	local att0 = Instance.new("Attachment")
+	att0.Parent = hrp
+
+	local anchor = Instance.new("Part")
+	anchor.Name        = "FlyAnchor"
+	anchor.Anchored    = true
+	anchor.CanCollide  = false
+	anchor.Transparency = 1
+	anchor.Size        = Vector3.new(0.1, 0.1, 0.1)
+	anchor.CFrame      = hrp.CFrame
+	anchor.Parent      = workspace
+
+	local att1 = Instance.new("Attachment")
+	att1.Parent = anchor
+
+	local lv = Instance.new("LinearVelocity")
+	lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+	lv.ForceLimitMode         = Enum.ForceLimitMode.PerAxis
+	lv.MaxAxesForce           = Vector3.new(1e5, 1e5, 1e5)
+	lv.VectorVelocity         = Vector3.zero
+	lv.RelativeTo             = Enum.ActuatorRelativeTo.World
+	lv.Attachment0            = att0
+	lv.Parent                 = hrp
+
+	local ao = Instance.new("AlignOrientation")
+	ao.MaxTorque       = Vector3.new(1e5, 1e5, 1e5)
+	ao.Responsiveness  = 50
+	ao.RigidityEnabled = false
+	ao.Attachment0     = att0
+	ao.Attachment1     = att1
+	ao.Parent          = hrp
+
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		if not flyData[player] then conn:Disconnect() return end
+		if not hrp or not hrp.Parent then conn:Disconnect() return end
+		anchor.CFrame     = hrp.CFrame
+		lv.VectorVelocity = Vector3.zero
+	end)
+
+	flyData[player] = {lv=lv, ao=ao, att0=att0, att1=att1, anchor=anchor, conn=conn}
+	notify(player, "Fly ON")
+end
+
+local function disableFly(player)
+	if not flyData[player] then return end
+	local d = flyData[player]
+	if d.conn   then d.conn:Disconnect() end
+	if d.lv     then d.lv:Destroy()     end
+	if d.ao     then d.ao:Destroy()     end
+	if d.att0   then d.att0:Destroy()   end
+	if d.att1   then d.att1:Destroy()   end
+	if d.anchor then d.anchor:Destroy() end
+	flyData[player] = nil
+	if rflyLoops[player] then
+		if type(rflyLoops[player]) ~= "boolean" then rflyLoops[player]:Disconnect() end
+		rflyLoops[player] = nil
+	end
+	local hum = getHum(player)
+	if hum then hum.PlatformStand = false end
+	notify(player, "Fly OFF")
+end
+
+-- ================================================
+-- NOCLIP
+-- ================================================
+local function enableNoclip(player)
+	if noclipData[player] then return end
+	local conn = RunService.Stepped:Connect(function()
+		local c = getChar(player)
+		if not c then return end
+		for _, p in ipairs(c:GetChildren()) do
+			if p:IsA("BasePart") then p.CanCollide = false end
+		end
+	end)
+	noclipData[player] = conn
+	notify(player, "Noclip ON")
+end
+
+local function disableNoclip(player)
+	if not noclipData[player] then return end
+	noclipData[player]:Disconnect()
+	noclipData[player] = nil
+	if rnoclipLoops[player] then
+		if type(rnoclipLoops[player]) ~= "boolean" then rnoclipLoops[player]:Disconnect() end
+		rnoclipLoops[player] = nil
+	end
+	local c = getChar(player)
+	if c then
+		for _, p in ipairs(c:GetChildren()) do
+			if p:IsA("BasePart") then p.CanCollide = true end
+		end
+	end
+	notify(player, "Noclip OFF")
+end
+
+-- ================================================
+-- GOD / INVIS / FREEZE
+-- ================================================
+local function applyGod(player)
+	local hum = getHum(player)
+	if not hum then return end
+	hum.MaxHealth = math.huge
+	hum.Health    = math.huge
+end
+
+local function enableGod(player)  applyGod(player); godData[player] = true;  notify(player, "God ON")  end
+local function disableGod(player)
+	local hum = getHum(player)
+	if hum then hum.MaxHealth = 100; hum.Health = 100 end
+	godData[player] = nil; notify(player, "God OFF")
+end
+
+local function applyInvis(player)
+	local c = getChar(player)
+	if not c then return end
+	for _, p in ipairs(c:GetDescendants()) do
+		if p:IsA("BasePart") or p:IsA("Decal") then p.Transparency = 1 end
+	end
+end
+
+local function enableInvis(player)  applyInvis(player); invisData[player] = true; notify(player, "Invisible ON") end
+local function disableInvis(player)
+	local c = getChar(player)
+	if c then
+		for _, p in ipairs(c:GetDescendants()) do
+			if p:IsA("BasePart") then
+				p.Transparency = p.Name == "HumanoidRootPart" and 1 or 0
+			elseif p:IsA("Decal") then
+				p.Transparency = 0
+			end
+		end
+	end
+	invisData[player] = nil; notify(player, "Visible ON")
+end
+
+local function applyFreeze(player)
+	local c = getChar(player)
+	if not c then return end
+	for _, p in ipairs(c:GetDescendants()) do
+		if p:IsA("BasePart") then p.Anchored = true end
+	end
+end
+
+local function enableFreeze(player)  applyFreeze(player); freezeData[player] = true; notify(player, "Freeze ON")  end
+local function disableFreeze(player)
+	local c = getChar(player)
+	if c then
+		for _, p in ipairs(c:GetDescendants()) do
+			if p:IsA("BasePart") then p.Anchored = false end
+		end
+	end
+	freezeData[player] = nil; notify(player, "Freeze OFF")
+end
+
+-- ================================================
+-- CLONE
+-- ================================================
+local function clonePlayer(player)
+	local char = getChar(player)
+	if not char then return end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	if cloneData[player] and cloneData[player].Parent then
+		cloneData[player]:Destroy(); cloneData[player] = nil
+	end
+
+	local clone = char:Clone()
+	clone.Name = player.Name.."_Clone"
+
+	for _, s in ipairs(clone:GetDescendants()) do
+		if s:IsA("Script") or s:IsA("LocalScript") or s:IsA("ModuleScript") then s:Destroy() end
+	end
+
+	local cloneHum = clone:FindFirstChildOfClass("Humanoid")
+	if cloneHum then cloneHum:Destroy() end
+
+	for _, p in ipairs(clone:GetDescendants()) do
+		if p:IsA("BasePart") then p.Anchored = true; p.CanCollide = false end
+	end
+
+	local cloneHRP = clone:FindFirstChild("HumanoidRootPart")
+	if cloneHRP then cloneHRP.CFrame = hrp.CFrame * CFrame.new(4, 0, 0) end
+
+	clone.Parent = workspace
+	cloneData[player] = clone
+	notify(player, "Clone creado! (30s)")
+
+	task.delay(30, function()
+		if clone and clone.Parent then
+			clone:Destroy()
+			if cloneData[player] == clone then cloneData[player] = nil end
+		end
+	end)
+end
+
+local function removeClone(player)
+	if cloneData[player] and cloneData[player].Parent then
+		cloneData[player]:Destroy(); cloneData[player] = nil
+		notify(player, "Clone eliminado")
+	end
+end
+
+-- ================================================
+-- ANTI-EXPLOIT â€” forward declaration para warnExploiter
+-- (necesaria porque onCharacterAdded la usa y se define antes)
+-- ================================================
+local warnExploiter   -- se asigna mÃ¡s abajo
+
+local function freezeForGui(player)
+	exploitFrozen[player] = true
+	local hum = getHum(player)
+	if hum then hum.WalkSpeed = 0; hum.JumpPower = 0 end
+end
+
+local function unfreezeForGui(player)
+	exploitFrozen[player] = nil
+	local hum = getHum(player)
+	if hum and not freezeData[player] then
+		local ws = allowedSpeed[player] and allowedSpeed[player].ws or 16
+		local jp = allowedSpeed[player] and allowedSpeed[player].jp or 50
+		hum.WalkSpeed = ws
+		hum.JumpPower = jp
+	end
+end
+
+local function exploitBan(player)
+	if not player or not player.Parent then return end
+	banned[player.UserId] = true
+	-- FIX: NO descongelar â€” jugador sigue congelado mientras ve la pantalla WOAS
+	showExploitGui:FireClient(player, "banned")
+	task.wait(4)
+	if player and player.Parent then
+		player:Kick("WOAS â€” Baneado permanentemente por usar exploits.")
+	end
+end
+
+-- FIX: debounce con exploitResponding para evitar doble disparo del RemoteEvent
+exploitResponse.OnServerEvent:Connect(function(player, answer)
+	if not exploitFrozen[player] then return end
+	if exploitResponding[player] then return end
+	exploitResponding[player] = true   -- bloquear inmediatamente
+
+	if exploitStrike2[player] then
+		-- Segunda ofensa: cualquier respuesta â†’ ban permanente, sin descongelar
+		exploitBan(player)
+	else
+		if answer == "no" then
+			-- Primera ofensa, prometiÃ³ parar â†’ perdonado
+			unfreezeForGui(player)
+			showExploitGui:FireClient(player, "forgiven")
+			print("[ANTI-EXPLOIT] "..player.Name.." perdonado.")
+			exploitWarned[player]    = true  -- FIX #3: marcar como ya advertido para next detect â†’ "again"
+			exploitResponding[player] = nil   -- permitir nueva detecciÃ³n futura
+		else
+			-- Primera ofensa, dijo que sÃ­ seguirÃ¡ â†’ ban inmediato
+			exploitStrike2[player] = true
+			exploitBan(player)
+		end
+	end
+end)
+
+-- Ahora asignamos la funciÃ³n (forward declaration resuelta)
+warnExploiter = function(player, reason)
+	if not player or not player.Parent then return end
+	if isAdmin(player) then return end
+	if exploitFrozen[player] then return end  -- ya estÃ¡ procesando
+
+	-- FIX #3: si ya fue advertido/perdonado antes â†’ pantalla "again" (segunda oportunidad ya usada)
+	if exploitStrike2[player] or exploitWarned[player] then
+		freezeForGui(player)
+		showExploitGui:FireClient(player, "again")
+	else
+		freezeForGui(player)
+		showExploitGui:FireClient(player, "first", reason)
+	end
+end
+
+local function attachHumListener(player, hum)
+	-- FIX #1: flag para evitar loop infinito al corregir el valor
+	-- FIX #2: guardar valor original para mostrarlo en el mensaje
+	local correctingWs = false
+	local correctingJp = false
+
+	hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+		if isAdmin(player) then return end
+		if exploitFrozen[player] then return end
+		if correctingWs then return end  -- evitar loop infinito
+		local maxWs = allowedSpeed[player] and allowedSpeed[player].ws or SPEED_LIMIT
+		if hum.WalkSpeed > maxWs + 2 then
+			local orig = hum.WalkSpeed   -- guardar ANTES de corregir
+			correctingWs = true
+			hum.WalkSpeed = maxWs        -- corregir (dispara PropertyChanged de nuevo)
+			correctingWs = false
+			warnExploiter(player, "WalkSpeed modificado ("..math.floor(orig)..")")
+		end
+	end)
+
+	hum:GetPropertyChangedSignal("JumpPower"):Connect(function()
+		if isAdmin(player) then return end
+		if exploitFrozen[player] then return end
+		if correctingJp then return end  -- evitar loop infinito
+		local maxJp = allowedSpeed[player] and allowedSpeed[player].jp or JUMP_LIMIT
+		if hum.JumpPower > maxJp + 2 then
+			local orig = hum.JumpPower
+			correctingJp = true
+			hum.JumpPower = maxJp
+			correctingJp = false
+			warnExploiter(player, "JumpPower modificado ("..math.floor(orig)..")")
+		end
+	end)
+end
+
+local function initAntiExploit(player)
+	exploitData[player] = {lastPos = nil, lastTime = tick(), heartbeatConn = nil}
+
+	-- FIX: guardar conn en exploitData para Disconnect en PlayerRemoving
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		if not player or not player.Parent then
+			conn:Disconnect()
+			return
+		end
+		if isAdmin(player) then return end
+		if exploitFrozen[player] then return end
+
+		local hrp = getHRP(player)
+		if not hrp then
+			if exploitData[player] then
+				exploitData[player].lastPos  = nil
+				exploitData[player].lastTime = tick()
+			end
+			return
+		end
+
+		local data = exploitData[player]
+		if not data then return end
+
+		local now = tick()
+		local dt  = now - data.lastTime
+
+		if dt >= DETECT_INTERVAL then
+			local pos = hrp.Position
+			if data.lastPos then
+				-- FIX: usar velocidad (studs/s) en lugar de distancia + ventana dt estrecha
+				local speed = (pos - data.lastPos).Magnitude / dt
+				if speed > TP_SPEED_LIMIT then
+					warn("[ANTI-EXPLOIT] "..player.Name.." â†’ "..math.floor(speed).." studs/s")
+					warnExploiter(player, "Teleport Hack ("..math.floor(speed).." studs/s)")
+				end
+			end
+			data.lastPos  = pos
+			data.lastTime = now
+		end
+	end)
+
+	exploitData[player].heartbeatConn = conn
+end
+
+-- ================================================
+-- RE-APLICAR EFECTOS TRAS RESPAWN
+-- FIX: UN SOLO CharacterAdded â€” los listeners de Hum van aquÃ­, no en initAntiExploit
+-- ================================================
+local function onCharacterAdded(player, char)
+	char:WaitForChild("HumanoidRootPart", 5)
+	local hum = char:WaitForChild("Humanoid", 5)
+	task.wait(0.2)
+
+	if godData[player]    then applyGod(player)    end
+	if invisData[player]  then applyInvis(player)   end
+	if freezeData[player] then applyFreeze(player)  end
+
+	if rflyLoops[player]    then task.wait(0.5); enableFly(player)    end
+	if rnoclipLoops[player] then task.wait(0.1); enableNoclip(player) end
+
+	-- Re-aplicar speed/jump permitidos por admin
+	if allowedSpeed[player] and hum then
+		hum.WalkSpeed = allowedSpeed[player].ws
+		hum.JumpPower = allowedSpeed[player].jp
+	end
+
+	-- Resetear posiciÃ³n anti-exploit al spawnear
+	resetExploitPos(player)
+
+	-- Conectar listeners de WalkSpeed/JumpPower (solo para no-admins)
+	if not isAdmin(player) and hum then
+		attachHumListener(player, hum)
+	end
+end
+
+local function onCharacterRemoving(player)
+	if flyData[player] then
+		local d = flyData[player]
+		if d.conn   then d.conn:Disconnect() end
+		if d.lv     then d.lv:Destroy()     end
+		if d.ao     then d.ao:Destroy()     end
+		if d.att0   then d.att0:Destroy()   end
+		if d.att1   then d.att1:Destroy()   end
+		if d.anchor then d.anchor:Destroy() end
+		flyData[player] = nil
+		local hum = getHum(player)
+		if hum then hum.PlatformStand = false end
+	end
+	if noclipData[player] then
+		noclipData[player]:Disconnect()
+		noclipData[player] = nil
+	end
+end
+
+-- ================================================
+-- PROCESAR COMANDOS
+-- ================================================
+local function processCommand(player, message)
+	if not isAdmin(player) then return end
+
+	message = message:gsub("^/%a+ ", ""):gsub("^%s+", ""):gsub("%s+$", "")
+
+	local args = {}
+	for word in message:gmatch("%S+") do table.insert(args, word) end
+	if #args == 0 then return end
+
+	local cmd = args[1]:lower()
+	table.remove(args, 1)
+
+	if cmd == "kill" then
+		for _, t in ipairs(getTargets(player, args[1])) do
+			local h = getHum(t); if h then h.Health = 0 end
+		end
+		notify(player, "Kill âœ“")
+
+	elseif cmd == "rkill" then
+		for _, t in ipairs(getTargets(player, args[1])) do
+			if rkillLoops[t] then
+				rkillLoops[t]:Disconnect(); rkillLoops[t] = nil
+				notify(player, "rkill OFF: "..t.Name)
+			else
+				local target = t
+				rkillLoops[target] = RunService.Heartbeat:Connect(function()
+					local h = getHum(target); if h then h.Health = 0 end
+				end)
+				notify(player, "rkill ON: "..t.Name)
+			end
+		end
+
+	elseif cmd == "unrkill" then
+		for _, t in ipairs(getTargets(player, args[1])) do
+			if rkillLoops[t] then rkillLoops[t]:Disconnect(); rkillLoops[t] = nil end
+		end
+		notify(player, "rkill OFF âœ“")
+
+	elseif cmd == "kick" then
+		local reason = args[2] or "Sin razÃ³n"
+		for _, t in ipairs(getTargets(player, args[1])) do
+			if t ~= player then t:Kick("Kickeado: "..reason) end
+		end
+		notify(player, "Kick âœ“")
+
+	elseif cmd == "ban" then
+		for _, t in ipairs(getTargets(player, args[1])) do
+			if t ~= player then banned[t.UserId] = true; t:Kick("Baneado permanentemente.") end
+		end
+		notify(player, "Ban âœ“")
+
+	elseif cmd == "tempban" then
+		local secs = tonumber(args[2]) or 300
+		for _, t in ipairs(getTargets(player, args[1])) do
+			if t ~= player then
+				tempBanned[t.UserId] = os.time() + secs
+				t:Kick("Baneado por "..secs.."s.")
+			end
+		end
+		notify(player, "Tempban "..secs.."s âœ“")
+
+	elseif cmd == "unban" then
+		local name = args[1]
+		if name then
+			local target = findPlayer(name)
+			if target then
+				banned[target.UserId] = nil; tempBanned[target.UserId] = nil
+				notify(player, target.Name.." desbaneado âœ“")
+			else
+				notify(player, "'"..name.."' no estÃ¡ en el servidor.")
+			end
+		end
+
+	elseif cmd == "fly" then
+		for _, t in ipairs(getTargets(player, args[1])) do
+			if flyData[t] then disableFly(t) else enableFly(t) end
+		end
+
+	elseif cmd == "unfly" then
+		for _, t in ipairs(getTargets(player, args[1])) do disableFly(t) end
+
+	elseif cmd == "rfly" then
+		for _, t in ipairs(getTargets(player, args[1])) do
+			if rflyLoops[t] then
+				if type(rflyLoops[t]) ~= "boolean" then rflyLoops[t]:Disconnect() end
+				rflyLoops[t] = nil; disableFly(t)
+				notify(player, "rfly OFF: "..t.Name)
+			else
+				enableFly(t); rflyLoops[t] = true
+				notify(player, "rfly ON: "..t.Name)
+			end
+		end
+
+	
